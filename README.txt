@@ -23,7 +23,10 @@ sufficiently advanced viewer.
 
 For more information on ProleText's history and a  
 comparison with later text markup systems like Markdown, 
-see #<http://oldvcr.blogspot.com/#>this blog post#:. 
+see 
+https://oldvcr.blogspot.com/2022/06/prior-art-dept-proletext-encoding-html.html         
+this blog post 
+.  
 
 Usage   	
 

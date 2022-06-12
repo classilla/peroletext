@@ -16,7 +16,7 @@ sufficiently advanced viewer.
 
 For more information on ProleText's history and a comparison with later
 text markup systems like Markdown, see
-[this blog post](http://oldvcr.blogspot.com/).
+[this blog post](https://oldvcr.blogspot.com/2022/06/prior-art-dept-proletext-encoding-html.html).
 
 ## Usage
 

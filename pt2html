@@ -408,7 +408,7 @@ sub proline {
 		$ret  = $self->inline($_);
 		$ret .= $self->cancel;
 		$ret .= <<"EOF";
-<HR><ADDRESS>help on invisible formatting</ADDRESS>
+<HR><ADDRESS><A HREF="https://oldvcr.blogspot.com/2022/06/prior-art-dept-proletext-encoding-html.html">help on invisible formatting</A></ADDRESS>
 EOF
 	}
 
