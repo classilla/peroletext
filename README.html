@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>PeroleText</h1>
+
+Copyright &copy; 2022 Cameron Kaiser.<br>
+All rights reserved.<br>
+Released under the Perl Artistic License 2.0.
+
+<h2>What is it?</h2>
+
+PeroleText is a set of two tools to convert to and from
+<a href="https://www.templetons.com/tech/proletext.html">ProleText</a>, an early
+text-based markup system circa 1995 that enabled HTML-like formatting encoded
+via trailing whitespace and certain inline sequences. This markup was generally
+invisible, allowing documents to appear largely as legible plain text to basic
+readers, but convertable into more-or-less full HTML (of the time) with a
+sufficiently advanced viewer.
+<p>
+For more information on ProleText's history and a comparison with later
+text markup systems like Markdown, see
+<a href="http://oldvcr.blogspot.com/">this blog post</a>.
+
+<h2>Usage</h2>
+
+The tools allow conversion from ProleText to HTML (<code>pt2html</code>), and
+HTML to ProleText with lossy conversion (<code>html2pt</code>). They are
+currently supported on Perl 5.8 or better, though they may work on earlier
+versions. No Perl modules are required to use them other than the basic
+Perl interpreter.
+<p>
+To use them as command line utilities, simply <code>chmod +x</code> either
+<code>pt2html</code> or <code>html2pt</code>, and pipe data to them:
+<p>
+<pre>
+% ./pt2html example.txt
+% ./html2pt test.html
+% curl http://oldvcr.blogspot.com/ | ./html2pt | ./pt2html
+</pre>
+<p>
+This document, in fact, was converted with <code>html2pt</code> and
+Html2Markdown.
+<p>
+Both tools accept a <code>-debug</code> option, allowing you to see the actual
+ProleText tuples and the view of the HTML parser, respectively. Try 
+<code>./pt2html -debug README.txt</code> to see the tuples generated for this
+very document.
+<p>
+To use them as Perl libraries, you can either <code>require "pt2html.pl"</code>
+or <code>require "html2pt.pl"</code> (which are symlinks), or
+<code>use PeroleText</code> or <code>use PeroleHTML</code> (which are also
+symlinks). No modification is needed; the files will do "the right thing"
+based on the context you use them in.
+<p>
+The PeroleText converters are line-oriented; you feed lines of text to them
+until you're out of data. Both have just three methods, differing only in the
+arguments to the constructor:
+<p>
+<pre>
+ my $p = new PeroleText([$debug]);
+ print $p-&gt;proline($string);
+ print $p-&gt;done;
+ 
+ my $p = new PeroleHTML([$debug,][$img]);
+ print $p-&gt;proline($string);
+ print $p-&gt;done;
+</pre>
+<p>
+The <code>$debug</code> argument (0=false, 1=true) indicates whether to run the
+converter in debug mode. For ProleText to HTML, this emits the tuples. For HTML
+to ProleText, this emits the view of the HTML parser. The second argument, only
+for <code>PeroleHTML</code>, says whether to always replace images with their
+<code>ALT</code> text (if true, <code>&lt;IMG&gt;</code> tags are used as is).
+Any unspecified argument to the constructor is treated as false.
+<p>
+Then, for each line of data, call the method <code>proline</code> (this is a
+specific pun I refuse to explain but Canadian Commodore users should get
+&mdash; hint: Jim Butterfield and Steve Punter), which will return a string
+you can print or store. This string may not include all of the elements you
+passed it, particularly in the HTML converter, so when you're out of data call
+the method <code>done</code> to return anything left over in the object's
+buffer. The object instance is not reusable when the conversion is complete;
+destroy it or let it go out of scope after calling <code>done</code>, and make
+a new instance if you need to do a new operation. Although there are other
+"secret" instance methods available for these objects, they should be
+considered neither public, stable nor supported.
+
+<h2>Pull requests and issues</h2>
+
+This is a toy project. I can't imagine you'd use this in a production
+environment, but if you have any ideas about doing so, slowly back away
+from the keyboard and think long and hard about the other bad choices
+you've made in life. Lots of sites probably won't work with the
+HTML-to-ProleText converter (in fact, those without significant text content
+will <em>definitely</em> not work). Issues that are not correctable may be
+closed as out of scope. Pull requests are accepted whenever I get around to
+them, which may be years from now.
+
+</body>
+</html>

@@ -1,0 +1,570 @@
+#!/usr/bin/perl -s
+
+# PeroleText: ProleText to HTML converter
+# Copyright (C) 2022 Cameron Kaiser. All rights reserved.
+# https://github.com/classilla/peroletext
+#
+# You can run this script in place, or |require| it, or rename it to a
+# .pm and |use| it. Just make sure you follow the Perl Artistic License
+# when you do, under which it is provided to you.
+
+# compatible with Perl 5.8+; may work with earlier versions
+use strict;
+
+# example usage
+unless (caller) { # magic
+	my $p = new PeroleText($main::debug);
+	while(<>) {
+		# let's see if Brad gets the joke
+		print $p->proline($_);
+	}
+	print $p->done;
+}
+
+package PeroleText;
+
+sub new {
+	my $class = shift;
+	my $debug = shift;
+
+	bless {
+		# state: 0=no HTML, never had; 1=in HTML; -1=deferred
+		# if debug is on, then immediately start in "on" mode
+		on => 0+$debug,
+		debug => $debug,
+
+		# last operation
+		lastop => '',
+
+		# in a P tag
+		lastp => 0,
+
+		# in an HEADING tag
+		h1 => 0, h2 => 0, h3 => 0, h4 => 0, h5 => 0,
+
+		# in <PRE>
+		pre => 0,
+
+		# in a definition list (changes LI)
+		isdefl => 0,
+
+		# in a multiline link2
+		link2 => '',
+
+		# in a multiline title
+		title => '',
+
+		# in a comment section
+		comment => 0,
+
+		# in a CENTHEAD section
+		centhead => 0,
+
+		# current ANCHOR
+		anchorwhat => 0,
+
+		# stack of linetags
+		lstack => [],
+
+	}, $class;
+}
+
+# handle stack of linetags
+sub state {
+	my $self = shift;
+	my $state = shift;
+
+	push(@{ $self->{lstack} }, $state);
+}
+sub undostate {
+	my $self = shift;
+	my $undo = shift;
+	my $ret = '';
+	my $x;
+
+	# this can underflow.
+	while($undo--) {
+		$x = pop(@{ $self->{lstack} });
+		$self->{isdefl} = 0 if ($x eq '</DL>');
+		$self->{pre} = 0 if ($x eq '</PRE>');
+		$ret .= $x;
+
+		last if (!scalar(@{ $self->{lstack} }));
+	}
+	return $ret;
+}
+
+# domain helper function for LINK, LINK2 and special escapes
+sub domainhelp {
+	my $self = shift;
+	my $url = shift;
+
+	$url =~ s/^\s+//;
+	$url =~ s/\040/\+/g;
+	$url =~ s/\042/\%22/g;
+
+	if ($url =~ m#^[a-z0-9]+:#) {
+		return $url;
+	} elsif ($url =~ /^www\./i) {
+		return "http://$url";
+	}
+
+	# future expansion?
+	return $url;
+}
+sub urlhelp { return '<A HREF="' . shift->domainhelp(shift) . '">'; }
+sub imghelp { return '<IMG SRC="' . shift->domainhelp(shift) . '">'; }
+
+# take a line, possibly with trailing encoded ProleText, and convert to HTML.
+sub proline {
+	my $old = $_;
+	my $self = shift;
+	$_ = shift;
+
+	my $tail = '';
+	my $op = '';
+	my $ret = '';
+	
+	# remove any trailing CRs and LFs
+	s/[\015\012]+$//;
+
+	# pull trailing tabs and spaces
+	s/([\040\011]+)$// && ($tail = $1);
+
+	# parse space-tab sequences into a numerical string
+	# truly blank line should be treated as a special case of code 2.
+	if (!length && !length($tail)) {
+		if ($self->{pre} || $self->{on} == 0) {
+			unless ($self->{debug}) {
+				# emit a blank line
+				$ret = "\n";
+				$_ = $old;
+				return $ret;
+			}
+		}
+		$op = 'X' unless ($self->{debug});
+	} else {
+		map { $op .= length } split(/\011/, $tail);
+		$op .= '0' if (substr($tail, -1, 1) eq "\011");
+	}
+
+	# purge EMPTY code, if present
+	$op = substr($op, 3) if (substr($op, 0, 3) eq '250');
+
+	##### PLAIN TEXT #####
+
+	# if we are not processing ProleText, then treat as a plain text
+	# line unless this is a HEADER
+	if ($self->{on} != 1 && substr($op, 0, 3) ne '220') {
+		# if ProleText has NEVER been on, then don't even do
+		# HTML substitutions.
+		if ($self->{on} == -1) {
+			s/\&/\&amp;/g;
+			s/\</\&lt;/g;
+			s/\>/\&gt;/g;
+		}
+		$ret = $_."\n";
+		$_ = $old;
+		return $ret;
+	}
+
+	# fixed width line: no trailing whitespace, enter <PRE> if not
+	# already done
+	if (!length($tail) && length) {
+		$ret  = $self->cancel(-1);
+		$ret .= $self->undostate(scalar(@{ $self->{lstack} }));
+		$ret .= "<PRE>" if (!$self->{pre} && !$self->{debug});
+		# we DO interpret inline entities in this mode
+		$ret .= $self->inline($_) . "\n";
+		$_ = $old;
+		$self->{pre} = 1;
+		return $ret;
+	}
+
+	# pre-ampersand encode < > & (but not #< #> #&)
+	s/(^|[^#])\&/\1\&amp;/g;
+	s/(^|[^#])\</\1\&lt;/g;
+	s/(^|[^#])\>/\1\&gt;/g;
+
+	# if debug mode is on, expose the decoded ops
+	if ($self->{debug}) {
+		$ret = sprintf("%6s> %s\n", $op, $_);
+		$_ = $old;
+		return $ret;
+	}
+
+	##### FIXUPS #####
+
+	# for now map 11 to 2, because there's no <NOTE> tag
+	$op="2" if ($op eq '11');
+
+	# map 4 to 2, because I refuse to implement RAW(4)
+	if ($op eq '4') {
+		warn "RAW(4) is intentionally not implemented\n";
+		$op="2";
+	}
+
+	##### GENERAL TAGS #####
+
+	# version/header
+	if (substr($op, 0, 3) eq '220') {
+		if ($op ne '220001') {
+			warn "unexpected proletext version ".
+				substr($op, 3). "\n";
+		}
+		# allow multiple HEADERs -- they become no-ops
+		$ret = ($self->{on} == 0) ? "<!DOCTYPE html><HTML>" :
+                       ($self->{on} ==-1) ? "</PRE>" : '';
+		$self->{needbody} = 1 if ($self->{on} == 0);
+		$self->{on} = 1;
+		$self->{pre} = 0;
+	}
+
+	# trailer
+	elsif ($op eq '230') {
+		$ret = "";
+		if ($self->{on} == 1) {
+			$ret .= $self->cancel;
+			$ret .= $self->undostate(scalar(@{ $self->{lstack} }));
+			# don't use <XMP>. we intercept < > anyway.
+			$ret .= "<PRE>" unless ($self->{debug});
+			$self->{pre} = 1;
+		}
+		$self->{on} = -1;
+	}
+
+	# continuation (a 1 by itself is END)
+	elsif ($op eq '1' && length) {
+		# because COMMENT is a general tag and not a line tag, it
+		# only affects continuation lines (and itself).
+		if ($self->{comment}) {
+			$ret = '';
+		} else {
+			$ret = ($self->{lastop} eq '1') ? "\n" : '';
+			$ret .= $self->inline($_);
+		}
+	}
+
+	# paragraph tag (blank line is END2)
+	elsif ($op eq '2' && length) {
+		$ret  = $self->cancel($op);
+		$ret .= $self->body; # do after: we might emit it above
+		$ret .= ($self->{lastop} eq '2') ? '' : '<P>';
+		$ret .= $self->inline($_);
+		$ret .= "\n" if length;
+
+		$self->{lastp} = 1;
+	}
+
+	# break
+	# the spec says this is 00, but inform uses 0. accept either.
+	elsif ($op eq '00' || $op eq '0') {
+		$ret  = $self->cancel;
+		$ret .= $self->inline($_)."<BR>\n";
+	}
+
+	# centhead
+	elsif ($op eq '10') {
+		$ret  = $self->cancel;
+		$ret .= "<CENTER>" . $self->inline($_). "\n";
+		$self->{centhead} = 1;
+	}
+
+	# h1 through h5 headings
+	elsif ($op =~ /^([2-6])0$/) {
+		my $h = $1 - 1;
+		$ret  = $self->cancel;
+		$ret .= $self->body;
+		$ret .= "<H${h}>" . $self->inline($_) . "\n";
+		$self->{"h${h}"} = 1;
+	}
+
+	# title
+	elsif ($op eq '70') {
+		$ret = $self->cancel;
+		# don't interpret inline escapes
+		$ret .= "<HEAD><TITLE>$_ ";
+		$self->{title} = 1;
+	}
+	
+	# h1title
+	elsif ($op eq '80') {
+		$ret = $self->cancel;
+		# don't interpret inline escapes
+		$ret .= "<HEAD><TITLE>$_</TITLE></HEAD>";
+		$ret .= $self->body;
+		$ret .= "<H1>";
+		$ret .= $self->inline($_) . "\n";
+		$self->{h1} = 1;
+	}
+
+	# points
+	elsif ($op eq '8') {
+		$ret = "<DT>" . $self->inline($_) . "\n";
+	}
+
+	# definitions OR list entries
+	elsif ($op eq '3') {
+		if ($self->{isdefl}) {
+			$ret = "<DD>" . $self->inline($_) . "\n";
+		} else {
+			s/^\s*[\*o]\s+//;
+			s/^\s*\d+\)\s+//;
+			# possible with a trailing LINK2 to have
+			# whitespace * whitespace as a bullet
+			$_ = '' if (/^\s*\*\s*$/);
+			$ret = "<LI>" . $self->inline($_) . "\n";
+		}
+	}
+
+	# comment mode
+	elsif ($op eq '5') {
+		$ret = '';
+	}
+
+	# singleline link
+	elsif ($op eq '6') {
+		$ret = $self->urlhelp($_) . $self->inline($_) . "</A>";
+	}
+
+	# multiline link (LINK2)
+	elsif ($op eq '9') {
+		$self->{link2} = $_;
+		# space with a newline. the browser will figure it out.
+		$ret = "\n" . $self->urlhelp($_);
+		# anchor text and closure added on cancellation
+	}
+
+	# images (that aren't inline)
+	elsif ($op eq '7') {
+		$ret = $self->imghelp($_) . "\n";
+	}
+
+	# horizontal rule
+	elsif ($op eq '01') {
+		$ret = "\n<HR>\n";
+	}
+
+	##### LINE TAGS #####
+
+	# ENDs
+	elsif ($op eq '1' || $op eq '2' || $op eq '3' || $op eq '4') {
+		$ret .= $self->undostate(0+$op);
+	}
+
+	# blank line is a paragraph break (but don't spew them)
+	elsif ($op eq 'X') {
+		$ret = $self->cancel($op);
+		$ret .= "<P>\n" unless ($self->{lastop} eq 'X' ||
+					$self->{needbody});
+	}
+
+	# unordered list
+	elsif ($op eq '31') {
+		$ret = $self->cancel;
+		$self->state("</UL>");
+		$ret .= "<UL>$_\n";
+	}
+
+	# ordered list (also map directory to this)
+	elsif ($op eq '32' || $op eq '33') {
+		$ret = $self->cancel;
+		$self->state("</OL>");
+		$ret .= "<OL>$_\n";
+	}
+
+	# inline <pre> (RAW 3,4 is a synonym)
+	elsif ($op eq '11' || $op eq '34') {
+		$ret = $self->cancel;
+		$self->state("</PRE>");
+		$ret .= "<PRE>$_\n";
+		$self->{pre} = 1;
+	}
+
+	# quote
+	elsif ($op eq '35') {
+		$ret = $self->cancel;
+		$self->state("</BLOCKQUOTE>");
+		$ret .= "<BLOCKQUOTE>$_\n";
+	}
+
+	# center (use old <center> for this, it's simpler)
+	elsif ($op eq '36') {
+		$ret = $self->cancel;
+		$self->state("</CENTER>");
+		$ret .= "<CENTER>$_\n";
+	}
+
+	# definition list
+	elsif ($op eq '37') {
+		$ret = $self->cancel;
+		$self->state("</DL>");
+		$ret .= "<DL>\n";
+		$self->{isdefl} = 1;
+	}
+
+	# help on invisible formatting
+	elsif ($op eq '41') { # no state
+		$ret  = $self->inline($_);
+		$ret .= $self->cancel;
+		$ret .= <<"EOF";
+<HR><ADDRESS>help on invisible formatting</ADDRESS>
+EOF
+	}
+
+	# insert anchor, and then become a paragraph block
+	elsif ($op eq '42') {
+		$ret  = $self->cancel;
+		$ret .= '<A NAME="a' . $self->{anchorwhat}++ . '"></A><P>';
+		$ret .= $self->inline($_);
+		$self->{lastp} = 1;
+		$op = '2';
+	}
+
+	else {
+		$ret = $_." >> ".$op."\n";
+	}
+
+	$self->{lastop} = $op;
+	$_ = $old;
+	return $ret;
+}
+
+sub body {
+	# emit opening <BODY> if not already done
+	my $self = shift;
+
+	return '' if (!$self->{needbody});
+	$self->{needbody} = 0;
+	return '<BODY>';
+}
+
+# auto-close open regular/block tags (not line tags)
+sub cancel {
+	my $self = shift;
+	my $op = shift;
+	my $ret = '';
+
+	$self->{comment} = 0;
+
+	if ($self->{pre} && $op != -1) {
+		$ret .= "</PRE>" unless ($self->{debug});
+		$self->{pre} = 0;
+	}
+
+	if ($self->{h1}) { $ret .= "</H1>"; $self->{h1} = 0; }
+	if ($self->{h2}) { $ret .= "</H2>"; $self->{h2} = 0; }
+	if ($self->{h3}) { $ret .= "</H3>"; $self->{h3} = 0; }
+	if ($self->{h4}) { $ret .= "</H4>"; $self->{h4} = 0; }
+	if ($self->{h5}) { $ret .= "</H5>"; $self->{h5} = 0; }
+
+	if ($self->{title}) {
+		# if we have multiple titles in a document, you geocities
+		# dweebs, you DESERVE malformed HTML.
+		$ret .= "</TITLE></HEAD>";
+		$ret .= $self->{body};
+		$self->{title} = 0;
+	}
+
+	if (length($self->{link2})) {
+		# if the last line was a LINK2 (not a continuation), repeat the
+		# title as link text.
+		$ret .= $self->{link2} if ($self->{lastop} eq '9');
+		$ret .= "</A>";
+		$self->{link2} = undef;
+	}
+
+	if ($self->{centhead}) {
+		$ret .= "</CENTER>";
+		$self->{centhead} = 0;
+	}
+
+	if ($self->{lastp}) {
+		if ($op ne '2' || $self->{lastop} eq '1') {
+			$ret .= "</P>";
+			$self->{lastp} = 0;
+			$self->{lastop} = '';
+		} else {
+			$self->{lastop} = $op;
+		}
+	} else {
+		$self->{lastop} = '' unless ($op eq 'X');
+	}
+
+	$ret .= "\n" if length($ret);
+	return $ret;
+}
+
+# take a line and parse for inline substitutions.
+sub inline {
+	my $ret;
+	my $old = $_;
+	my $escape = 0;
+	my $eescape = 0;
+	my $self = shift;
+	$_ = shift;
+
+	study;
+
+	# escape #&
+	$eescape++ while (/SSCAPESEQUENCE${eescape}/);
+	s/\#\&/SSCAPESEQUENCE${eescape}/g;
+
+	# boldface
+	$escape++ while (/ESCAPESEQUENCE${escape}/);
+	s/\#\*/ESCAPESEQUENCE${escape}/g;
+	for(;;) {
+		if (s/(^|[^\*])\*([^\* ])/\1<STRONG>\2/) {
+			if (s/([^\* ])\*([^\*]|$)/\1<\/STRONG>\2/) {
+				# balanced tag
+				next;
+			}
+			# cancel at end
+			$_ .= "</STRONG>";
+		} else { last; }
+	}
+	s/ESCAPESEQUENCE${escape}/\*/g;
+
+	# italics
+	s/\#_/ESCAPESEQUENCE${escape}/g;
+	for(;;) {
+		if (s/(^|[^_])_([^ _])/\1<I>\2/) {
+			next if (s/([^ _])_([^_]|$)/\1<\/I>\2/);
+
+			$_ .= "</I>";
+		} else { last; }
+	}
+	s/ESCAPESEQUENCE${escape}/_/g;
+
+	# links
+	# only parse a block that has #< ># with no " < >
+	s/#\<([^"'<>]+)#\>/$self->urlhelp($1)/egi;
+	s/#\:/<\/A>/g;
+
+	# turn leftover #< and #> into &lt; &gt;
+	s/\#\</#&lt;/g;
+	s/\#\>/#&gt;/g;
+
+	# images
+	# only parse in blocks
+	s/#\{([^"'<>]+)#\}/$self->imghelp($1)/egi;
+
+	# unescape #
+	s/SSCAPESEQUENCE${eescape}/\#/g;
+
+	$ret = $_;
+	$_ = $old;
+	return $ret;
+}
+
+sub done {
+	my $self = shift;
+	my $ret = $self->cancel;
+	$ret .= $self->undostate(scalar(@{ $self->{lstack} }));
+	$ret .= "</BODY></HTML>\n" if ($self->{on} != 0 && !$self->{debug});
+
+	return $ret;
+}
+
+package main; 1;
+

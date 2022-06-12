@@ -1,0 +1,682 @@
+#!/usr/bin/perl -s
+
+# PeroleHTML: HTML to ProleText converter
+# Copyright (C) 2022 Cameron Kaiser. All rights reserved.
+# https://github.com/classilla/peroletext
+#
+# You can run this script in place, or |require| it, or rename it to a
+# .pm and |use| it. Just make sure you follow the Perl Artistic License
+# when you do, under which it is provided to you.
+
+# compatible with Perl 5.8+; may work with earlier versions
+use strict;
+
+# example usage
+unless (caller) { # magic
+	my $p = new PeroleHTML($main::debug, $main::img);
+	while(<>) {
+		# let's see if Brad gets the joke
+		print $p->proline($_);
+	}
+	print $p->done;
+}
+
+package PeroleHTML;
+
+sub new {
+	my $class = shift;
+	my $debug = shift;
+	my $img = shift;
+
+	bless {
+		# options
+		alt => ($img) ? 0 : 1, # use alt text for images
+		debug => $debug,
+
+		# emitted header
+		header => 0,
+
+		# input buffer
+		ibuf => '',
+
+		# special tags and blocks we suppress
+		istyle => 0,
+		iscript => 0,
+
+		# other HTML modes
+		ipre => 0,
+		idl => 0, # the other lists track with indent size
+		h1 => 0, h2 => 0, h3 => 0, h4 => 0, h5 => 0,
+
+		# ProleText modes
+		link2 => 0,
+
+		# output buffer (line being built)
+		obuf => '',
+		oword => '', # current word
+		
+		# output tuple (of the line being built)
+		otu => '',
+		dotu => '', # deferred by LINK2
+		hotu => '', # hint tuple
+
+		# any indentation (of the line being built)
+		oindent => '',
+		oliindent => '', # and extra for any points or lines
+
+		# any inline decoration (of the line being built)
+		oidec => [], # upcoming
+		oidecw => [], # for the current word
+
+		# any terminators for oidec
+		oidect => [],
+		oidectw => [],
+
+		# try to deduplicate useless blank continuation lines
+		lastcon => 0,
+
+		# try to deduplicate useless empty lines
+		blanklines => 0,
+
+	}, $class;
+}
+
+# take a tuple like 2,2,0 and turn it into whitespace formatting
+sub tuple { shift && join("\011", map { " " x $_ } @_); }
+
+# manage inline decorators and their terminators. these operate on
+# the NEXT word - a word in progress keeps a copy of the state as it
+# was when the word was started, since a tag pushing text may cause
+# a break requiring a decorator to be repeated (especially <I>, etc.).
+# if we don't keep the word's copy separate, it will not repeat the
+# inline decoration correctly if it wraps to the next line.
+sub idec {
+	my $self = shift;
+	my $idec = shift;
+	my $idect = shift;
+
+	# clear duplicates
+	$self->noidec($idec, $idect);
+
+	push(@{ $self->{oidec} }, $idec) if length($idec);
+	push(@{ $self->{oidect} }, $idect) if length($idect);
+}
+sub noidec {
+	my $self = shift;
+	my $idec = shift;
+	my $idect = shift;
+
+	if (length($idec)) {
+		my @narr = grep ((substr($_, 0, length($idec)) ne $idec),
+			@{ $self->{oidec} });
+		$self->{oidec} = \@narr;
+	} 
+	if (length($idect)) {
+		my @narr = grep ((substr($_, 0, length($idect)) ne $idect),
+			@{ $self->{oidect} });
+		$self->{oidect} = \@narr;
+	}
+}
+
+# return next token from the internal buffer (either a tag or a character).
+# translate entities to characters, escaped if needed. return type and data.
+# type = 0: nothing to return (need data)
+# type = 1: HTML tag. return tag head, closed or not, and any attributes.
+# type = 2: character
+sub token {
+	my $self = shift;
+	my $ret = '';
+	my $retc = 0;
+	my %atts = ();
+	my $ci = 0;
+	my $cj = 0;
+	my $ca = 0;
+
+	# hash-escape special characters (private to this function)
+	my $hae = sub {
+		my $x = shift;
+		return $x if ($self->{ipre});
+		return
+			($x eq '#') ? '#&' :
+			($x eq '*') ? '#*' :
+			($x eq '_') ? '#_' :
+		$x;
+	};
+	# push characters back on the stream (also private, sssh)
+	my $pushback = sub { $self->{ibuf} = shift(@_) . $self->{ibuf}; };
+
+	# in a few circumstances we need multiple bites at the apple
+	for(;;) {
+		last if (!length($self->{ibuf}));
+
+		# peek at the next character to decide what it is
+		if (substr($self->{ibuf},0,1) eq '&') {
+			# HTML entity. try space or ; delimited.
+			$ci = index($self->{ibuf}, ";", 1);
+			$cj = index($self->{ibuf}, " ", 1);
+
+			# no ; yet, need more data
+			return (0, '') if ($ci == -1 && $cj == -1);
+
+			# extract entity
+			$ci =	($ci == -1) ? $cj : ($cj == -1) ? $ci :
+				($ci > $cj) ? $cj : $ci;
+			$ret = substr($self->{ibuf}, 0, $ci + 1);
+			$self->{ibuf} = substr($self->{ibuf}, $ci + 1);
+
+			# &#dddd;
+			($ret =~ s/\&\#([0-9]+);/chr($1)/e) &&
+				return (2, &$hae($ret));
+			# &#x----;
+			($ret =~ s/\&\#x([0-9a-fA-F]+);/chr(hex($1))/e) &&
+				return (2, &$hae($ret));
+
+			# entity table
+
+			# single characters: return directly
+			($ret eq '&lt;') && return(2, '<');
+			($ret eq '&gt;') && return(2, '>');
+			($ret eq '&amp;') && return(2, '&');
+
+			# multiple character expansion: push back
+			($ret eq '&copy;') && do { &$pushback("(C)"); next; };
+			($ret eq '&trade;') && do { &$pushback("(TM)"); next; };
+			($ret eq '&mdash;') && do { &$pushback("--"); next; };
+
+			# unknown entity; return a placeholder
+			return (2, '.');
+		} elsif (substr($self->{ibuf},0,1) eq '<') {
+			# HTML tag.
+			# try comment first. if not, try > or < delimited.
+			if (substr($self->{ibuf},0,4) eq '<!--') {
+				$ci = index($self->{ibuf}, '-->', 4);
+				$cj = -1;
+				$ca = 3;
+			} else {
+				$ci = index($self->{ibuf}, ">", 1);
+				$cj = index($self->{ibuf}, "<", 1);
+				$ca = 1;
+			}
+
+			# no > yet, need more data
+			return (0, '') if ($ci == -1 && $cj == -1);
+
+			# extract tag
+			$ci =	($ci == -1) ? $cj : ($cj == -1) ? $ci :
+				($ci > $cj) ? $cj : $ci;
+			$ret = substr($self->{ibuf}, 0, $ci + $ca);
+			$self->{ibuf} = substr($self->{ibuf}, $ci + $ca);
+
+			# attempt to collapse head and tail whitespace
+			# <...TAG...> => TAG
+			$ret =~ s/^<\s*//;
+			$ret =~ s/\s*>?$//;
+
+			# skip comments
+			next if (substr($ret, 0, 3) eq '!--');
+
+			# turn CR LF into LF, convert WS*LF*WS* to whitespace
+			$ret =~ s/\015\012/\012/g;
+			1 while ($ret =~ s/\s*\012+\s*/ /sg);
+
+			($ci, $cj) = split(/\s+/, $ret, 2);
+
+			# create a hash of attributes
+			while(length($cj)) {
+				# try attr="value"
+				if ($cj =~ s/([^\/'"\s=]+)\s*=\s*"([^"]*)"($|\s+)//) {
+					$atts{uc($1)} = $2;
+				# try attr='value'
+				} elsif ($cj =~ s/([^\/'"\s=]+)\s*=\s*'([^']*)'($|\s+)//) {
+					$atts{uc($1)} = $2;
+				# try attr=value
+				} elsif ($cj =~ s/([^\/'"\s=]+)\s*=\s*([^\s\>]*)($|\s+)//) {
+					$atts{uc($1)} = $2;
+				# um, try attr?
+				} elsif ($cj =~ s/([^\/'"\s=]+)($|\s+)//) {
+					$atts{uc($1)} = undef;
+				# well, shoot, just snarf it all, son
+				} else { $atts{$cj} = undef; last; }
+			}
+
+			# image heuristics
+			# I don't like interpreting *any* tag at this level,
+			# but we don't have a lot of choice for injecting
+			# alt-text back into the stream.
+			$ci = uc($ci);
+			if ($ci eq 'IMG' && $self->{alt}) {
+				# replace tag with ALT text
+				my $alt = ' ' .
+					(length($atts{'ALT'}) ?
+					$atts{'ALT'} : '[Image]')
+				. ' ';
+				# don't choke on our own bile
+				$alt =~ s/</\&lt;/g;
+				$alt =~ s/>/\&gt;/g;
+				&$pushback($alt);
+
+				# loop back and get characters from the ALT
+				next;
+			}
+
+			return (substr($ci, 0, 1) eq '/') ?
+				(1, substr($ci, 1), 1,
+					scalar(keys(%atts)) ? \%atts : undef) :
+				(1, $ci, 0,
+					scalar(keys(%atts)) ? \%atts : undef);
+		} else {
+			# other character
+			$ret = substr($self->{ibuf},0,1);
+			$self->{ibuf} = substr($self->{ibuf}, 1);
+			return (2, &$hae($ret));
+		}
+	}
+	# unpossibreachable (probably)
+	return (0, '');
+}
+
+sub proline {
+	my $self = shift;
+	my $inline = shift;
+
+	my $attref;
+	my $line = $self->{obuf};
+	my $word = $self->{oword};
+	my $debug = $self->{debug};
+	my $ret = ($self->{header}) ? '' : $self->tuple(2,2,0,0,0,1)."\n";
+	my $tt = 0;
+	my $h = '';
+	my $t = '';
+	my $c = 0;
+
+	$self->{ibuf} .= $inline;
+	$self->{header} = 1;
+
+	# private utility functions that only make sense in this scope.
+	# these largely handle wordwrap and ProleText's unusual rules.
+
+	my $breakword = sub { # break a word with a provided character
+		my $h = shift;
+		my $force = shift;
+		my $l = length($word);
+		my $cl = '';
+
+		# compute leading inline decorators and terminal ones for
+		# this word. when the word is complete, we update.
+		my $soidec = join('', @{ $self->{oidecw} });
+		my $soidect = join('', @{ $self->{oidectw} });
+
+		if (!$force && !$l) {
+			# nothing to do, eat the whitespace
+			return;
+		}
+
+		# compute effective line length
+		$l += length($h);
+		$l += length($line); # already has any indent and decorators
+		$l += length($soidect) if (length($soidec));
+		if ($l < 60) {
+			# don't need to wrap
+			$line .= $word.$h;
+			$word = '';
+			# update decorators
+			$self->{oidecw} = $self->{oidec};
+			$self->{oidectw} = $self->{oidect};
+			return unless ($force);
+
+			# oops, forced to continue, decorators now stale
+			$soidec = join('', @{ $self->{oidecw} });
+			$soidect = join('', @{ $self->{oidectw} });
+		}
+
+		if (!length($line)) { # can happen with flushes
+			$line = $self->{oindent}.$self->{oliindent}.$soidec;
+			$line .= $word.$h if (length($word));
+			$word = '';
+			$self->{oidecw} = $self->{oidec};
+			$self->{oidectw} = $self->{oidect};
+			return;
+		}
+
+		# overflowed; break the line. put new decorators on the
+		# next line and update any pending changes for the new word.
+		$line =~ s/\s+$//; # paranoia
+		$cl = $line;
+		$line = $self->{oindent}.$self->{oliindent}.$soidec;
+		$line .= $word.$h if (length($word));
+		$word = '';
+		$self->{oidecw} = $self->{oidec};
+		$self->{oidectw} = $self->{oidect};
+
+		# emit terminal decorations (if any) to the wrapped line
+		$cl .= "$soidect" if length($soidec);
+
+		# if this is tagged with a tuple, emit the tuple and newline
+		if (length($self->{otu})) {
+			$ret .= $cl . $self->{otu} . "\n";
+			$self->{hotu} = $self->{otu}; # save hint
+			$self->{otu} = '';
+			return;
+		}
+
+		# no tuple, call it a continuation line
+		return if ($cl =~ /^\s*$/); # suppress blanks
+		$ret .= $cl . $self->tuple(1) . "\n";
+		return;
+	};
+	my $flushline = sub { # flush the line and any broken words
+		if (length($word)) {
+			# first break: move line to ret, move word to line
+			&$breakword('');
+		}
+		# second break: move line to ret, word remains blank
+		&$breakword('', 1);
+		#$self->{oliindent} = '';
+	};
+	my $addtext = sub { # add a string or character, breaking if needed
+		my $h = shift;
+
+		if ($h eq "\015") {
+			# suppress
+		} elsif ($h eq "\012") {
+			# treat as whitespace: see next
+			&$breakword(' ');
+		} elsif ($h =~ /^\s+$/) {
+			# whitespace: try to add the next word
+			&$breakword($h);
+		} else {
+			# not whitespace: add text to word buffer
+			$word .= $h;
+			&$breakword('') if (length($word) > 58);
+		}
+	};
+	my $end2 = sub { # convenience function
+		$ret .= "\n";
+		$self->{otu} = $self->tuple(2);
+		$self->{oliindent} = '';
+	};
+	my $tag = sub { # general container tag template
+		my $c = shift;
+		my $tuple = $self->tuple(@_);
+
+		&$flushline;
+		if ($c) { &$end2; } else { $self->{otu} = $tuple; }
+	};
+	my $list = sub { # general list tag template
+		my $c = shift;
+		my $padding = " " x shift;
+		my $tuple = $self->tuple(@_);
+
+		&$flushline;
+		if ($c) {
+			$ret .= "\n \n";
+			$self->{oliindent} = '';
+			$self->{oindent} = substr($self->{oindent},
+				length($padding)) if length($padding);
+		} else {
+			$ret .= "$tuple\n";
+			$self->{oindent} .= $padding
+				if length($padding);
+		}
+	};
+
+	# loop over all available tokens.
+	TOKEN: for(;;) {
+		($tt, $h, $c, $attref) = $self->token;
+
+		# dump the HTML if -debug specified (shows you the view)
+		if ($debug) {
+			return $ret if (!$tt);
+			if ($tt == 2) {
+				$ret .= $h;
+			} else {
+				$ret .= ($c) ? "</$h" : "<$h";
+				if($attref != undef) {
+					$ret .= "\n";
+					foreach $t (keys %{ $attref }) {
+						$ret .= " $t";
+						$ret .= '="' . $attref->{$t} . '" '
+							if (length($attref->{$t}));
+						$ret .= "\n";
+					}
+				}
+				$ret .= ">";
+			}
+			next; # does not enter parse loop
+		}
+
+		# parse loop
+
+		# suppress blocks we want suppressed
+		if ($tt == 1) {
+			if ($h eq 'STYLE') {
+				$self->{istyle} = ($c) ? 0 : 1;
+				next;
+			} elsif ($h eq 'SCRIPT') {
+				$self->{iscript} = ($c) ? 0 : 1;
+				next;
+			}
+		}
+		next if ($tt && ($self->{istyle} || $self->{iscript}));
+
+		# handle characters
+		if ($tt == 2) {
+			if ($self->{ipre}) {
+				# in pre-mode, just accumulate: no word wrap,
+				# no whitespace formatting.
+				$ret .= $h;
+			} else {
+				# not in pre-mode, so word wrap to 60 CPL
+				&$addtext($h);
+			}
+			next;
+		}
+
+		# handle underflow
+		if ($tt == 0) {
+			# line must be incomplete (or the above would have
+			# handled it), so stash the line as next call's buffer
+			# and return the accumulated text.
+			$self->{obuf} = $line;
+			$self->{oword} = $word;
+			return '' if (!length($ret));
+
+			# output filtration
+			# try to avoid newline spew
+			if ($ret =~ /^\n+$/s) {
+				if ($self->{blanklines} == 0) {
+					$self->{blanklines} += length($ret);
+					return "\n";
+				}
+				$self->{blanklines} += length($ret);
+				return '' if ($self->{blanklines} > 1);
+				return $ret;
+			}
+
+			$self->{blanklines} = 0;
+			return $ret;
+		}
+
+		# handle other tags
+		if ($h eq 'PRE') {
+			next if ($c != $self->{ipre}); # shenanigans
+			if ($c) {
+				$ret .= "\n" . $self->tuple(2,2,0,0,0,1)."\n";
+				$self->{ipre} = 0;
+			} else {
+				&$flushline;
+				$ret .= $self->tuple(2,3,0)."\n";
+				$self->{ipre} = 1;
+			}
+		} elsif ($h eq 'BR') {
+			# this is notionally (0,0) but <br>s can be within
+			# containers, so we need to emit a useful equivalent.
+			my $q;
+
+			&$flushline;
+
+			# don't do anything if we're indented (can't
+			# meaningfully do so within a list)
+			next if (length($self->{oindent}) ||
+				 length($self->{oliindent}));
+
+			&$end2;
+
+			# headings: try to continue them
+			foreach $q (1..5) {
+				if ($self->{'h'.$q}) {
+					$self->{otu} = $self->tuple($q+1, 0);
+					next TOKEN;
+				}
+			}
+		} elsif ($h eq 'P') {
+			# don't do anything with </P>, if present
+			# don't accidentally cancel UL, OL or DL
+			unless ($c || $self->{idl} || length($self->{oindent})){
+				&$flushline;
+				&$end2;
+			}
+		} elsif ($h eq 'B' || $h eq 'STRONG') {
+			# set autodecorators FIRST because we could wrap.
+			if ($c) {
+				$self->noidec('*');
+			} else {
+				$self->idec('*');
+			}
+			# no terminal decorator needed; this is autoclosing
+			&$addtext('*'); # closing and opening
+		} elsif ($h eq 'I' || $h eq 'EM') {
+			# set autodecorators FIRST because we could wrap.
+			if ($c) {
+				$self->noidec('_');
+			} else {
+				$self->idec('_');
+			}
+			# no terminal decorator needed; this is autoclosing
+			&$addtext('_'); # closing and opening
+		} elsif ($h eq 'A') {
+			# the LINK2 tuple is not flexible enough because we
+			# can have links in blocks. better for us to emit
+			# inline links, repeating them if needed over
+			# multiple lines. however, for long URLs, LINK2 is
+			# more efficient despite its disadvantages.
+			if ($c) {
+				unless ($self->{link2}) {
+					# turn off decorator first, if any
+					$self->noidec('#<', '#:');
+					&$addtext('#:');
+				} else {
+					&$flushline;
+					# restore last block. but if all we
+					# have is just a continuation,
+					# then fall back on a PARA
+					$self->{otu} = $self->{dotu};
+					$self->{link2} = 0;
+				}
+			} else {
+				my $url = $attref->{'HREF'};
+				next if (!defined($url));
+				$url =~ s#^http://www\.#www.#;
+
+				if (length($url) < 45) { # value out of my butt
+					# try inline decoration	
+
+					$url = "#<$url#>";
+					# advance break if needed
+					if (length($line) + length($url) > 58) {
+						&$flushline;
+					}
+					#$self->idec($url, '#:'); # not needed?
+					$self->{link2} = 0;
+					&$addtext($url);
+				} else {
+					# do LINK2 instead
+
+					&$flushline;
+					$ret .= $url . $self->tuple(9) . "\n";
+					if (!length($self->{otu})) {
+						# use hint cache, hope it's ok
+						$self->{dotu} = $self->{hotu};
+					} else {
+						$self->{dotu} = $self->{otu};
+					}
+					$self->{otu} = '';
+					$self->{link2} = 1;
+				}
+			}
+
+		# various containers: use tag template when feasible
+		} elsif ($h eq 'TITLE') {
+			&$tag($c, 7, 0);
+		} elsif ($h eq 'DIV') {
+			&$tag($c, 2);
+		} elsif ($h =~ /^H([1-5])$/) { # headings
+			my $level = $1;
+
+			# track state for BR
+			$self->{'h'.$level} = ($c) ? 0 : 1;
+
+			&$flushline; &$end2; # always pad
+			$self->{otu} = $self->tuple($level+1, 0) if (!$c);
+		} elsif ($h eq 'LI' || $h eq 'DD') {
+			$self->{oliindent} = substr($self->{oliindent}, 4);
+			next if ($c);
+
+			&$tag($c, 3);
+
+			# insert bullets and/or numbering
+			$line .= $self->{oliindent};
+			if ($self->{iol}) {
+				$line .= sprintf("%2d. ", $self->{iol}++);
+			} else {
+				$line .= "  * ";
+			}
+			$self->{oliindent} .= '    '; # match template
+		} elsif ($h eq 'DT') {
+			next if ($c);
+			&$tag($c, 8);
+			&$addtext('...');
+
+		# various lists
+		} elsif ($h eq 'UL') {
+			&$list($c, 2, 3, 1);
+		} elsif ($h eq 'OL') {
+			&$list($c, 2, 3, 1);
+		} elsif ($h eq 'DL') {
+			$self->{idl} = ($c) ? 0 : 1;
+			&$list($c, 0, 3, 1);
+
+		# various elements
+		} elsif ($h eq 'IMG') {
+			my $src = $attref->{'DATA-SRC'};
+			$src = $attref->{'SRC'} if (!defined($src));
+			next if (!defined($src));
+
+			# I don't like the inline version for this.
+			&$flushline;
+			$ret .= $src . $self->tuple(7) . "\n";
+			&$end2;
+			$self->{otu} = '';
+		} elsif ($h eq 'HR') {
+			&$flushline;
+			&$end2;
+			$ret .= "-" x 60 . $self->tuple(0,1) . "\n";
+			$self->{otu} = '';
+
+		# other tags: ignore
+		}
+	}
+}
+
+sub done {
+	my $self = shift;
+
+	# if there is any residual data in the input buffer, it cannot be
+	# processed, so warn the user.
+	warn "unprocessed data remains in buffer\n" if (length($self->{ibuf}));
+
+	return $self->{obuf}. "\n";
+}
+
+package main; 1;
+
